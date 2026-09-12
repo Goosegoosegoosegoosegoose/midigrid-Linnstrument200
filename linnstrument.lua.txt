@@ -1,0 +1,503 @@
+-- Linnstrument support file by @nightmachines
+-- 2021-05-18
+--
+-- Thanks to @jaggednz
+--
+-- PATCHED by Bruce, 2026-09:
+--   1. Honor midigrid's force_full_refresh flag in refresh() so a
+--      reconnect/hot-reload actually repaints every LED instead of relying
+--      on a stale diff, which was leaving stray lit pads behind.
+--   2. Interpret RIGHT-split presses (columns beyond this device's grid
+--      width) ourselves and generate proper notes, instead of relying on the
+--      LinnStrument's own per-split MIDI mode.
+--   3. Reserve column 17 (the first column past the grid) as a dedicated
+--      "output device select" control instead of a playable note: each pad
+--      in that column picks a different MIDI output device for the rest of
+--      the right split (columns 18+) to play through, numbered by slot
+--      starting at the TOP pad (slot 1) down to the bottom (slot 8) -- up to
+--      8 output devices. Pressing a pad that isn't wired up to a device yet
+--      does nothing.
+--   4. When switching output devices, automatically send an all-notes-off
+--      (both explicit note_offs for anything this script thinks is still
+--      held, and a CC 123 All Notes Off as a broader safety net) to the
+--      device being switched AWAY from, so a note you were holding when you
+--      switched can't get stuck sounding forever on the old device.
+--   5. True per-note MPE on the right split: each held note is assigned its
+--      own MIDI output channel (dynamically, from a pool of 2-16, freed on
+--      release) instead of all notes sharing one fixed channel, so pitch
+--      bend / pressure on one note doesn't affect others -- as long as they
+--      land on different physical rows (see the big note below).
+--   6. Pitch bend / channel pressure / poly key pressure arriving from the
+--      LinnStrument are, for now, only logged (see _handle_right_split_expression)
+--      rather than forwarded, so we can confirm the exact message shape norns
+--      produces for these before wiring up real translation -- see the
+--      comment on that function for why.
+--
+-- Why #2 is necessary: midigrid requires the LinnStrument's "User Firmware
+-- Mode" to be on so that the LEFT split's raw column/row data (channel=row,
+-- note=column) works as a grid. But User Firmware Mode turned out to be an
+-- all-or-nothing toggle for the WHOLE instrument, not scoped to just the
+-- grid's 16 columns -- so while it's on, it also overrides the RIGHT
+-- split's own configured MIDI mode (ChPerNote/MPE, One Channel, whatever),
+-- and the right split arrives in that same raw channel=row/note=column
+-- encoding instead. Rather than fight the LinnStrument for control of that
+-- split's native behavior, we just read the raw column+row for any note
+-- past the grid's width and build our own note from it, using a 4ths-tuning
+-- layout (like the LinnStrument's own default tuning): +1 semitone per
+-- column, +5 semitones (a perfect fourth) per row.
+--
+-- IMPORTANT LIMITATION for #5/#6: because User Firmware Mode forces the
+-- WHOLE board into that same raw encoding, the LinnStrument's continuous
+-- data (pitch bend, pressure) can only ever arrive at per-ROW granularity --
+-- channel = row, no note number attached, since pitch bend and channel
+-- pressure are inherently channel-wide MIDI messages, not per-note ones.
+-- That's true for both splits alike. So: one note per row at a time (the
+-- common case -- one finger per row, or chords that span different rows,
+-- which is typical in a 4ths-tuning layout) gets fully independent per-note
+-- expression, by routing that row's incoming data to whichever note is
+-- currently active on it. Two notes held on the SAME row at once can't be
+-- told apart at the input level -- the hardware simply doesn't say which of
+-- the two a slide belongs to -- so both would receive the same incoming
+-- value in that case. This is a hard limit of the raw UFM data, not
+-- something fixable in software.
+--
+-- Also paints static LEDs across the right split matching the LinnStrument's
+-- own native Note Lights behavior for this layout (root/C = cyan, other
+-- scale tones = blue, out-of-scale notes dark), since that layer is fully
+-- overridden by User Firmware Mode too. Column 17 gets its own LED scheme
+-- (see _light_select_column) showing which output device is currently active.
+
+local prevBuffer1 = {
+  {0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0},
+}
+local prevBuffer2 = {
+  {0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0},
+}
+
+local device={
+
+  width=16,
+  height=8,
+
+  vgrid={},
+  midi_id = 1,
+  refresh_counter = 0,
+
+  brightness_map = {7,1,1,9,9,9,2,2,2,10,10,10,4,4,4,8},
+  -- 0=as set in Note Lights settings, 1=red, 2=yellow, 3=green, 4=cyan, 5=blue, 6=magenta, 7=OFF, 8=white, 9=orange, 10=lime, 11=pink
+
+  init_device_msg = { 0x63, 0x01, 0x62, 0x75, 0x06, 0x00, 0x26, 0x00, 0x65, 0x7f, 0x64, 0x7f, -- NRPN 245 value 0: normal mode, clears LEDs
+                      0x63, 0x01, 0x62, 0x75, 0x06, 0x00, 0x26, 0x01, 0x65, 0x7f, 0x64, 0x7f } , -- NRPN 245 value 1: user firmware mode, clears all LEDs
+
+  current_quad = 1,
+
+  -- ---- right-split layout ----
+  -- Column 17 is the dedicated device-select control (see output_devices
+  -- below); playable notes start one column further right than before.
+  select_column = 17,
+  note_start_column = 18,
+  right_split_total_columns = 25, -- LinnStrument 200 has 25 physical columns
+
+  -- 4ths-tuning layout for the right split: note_start_column / row 1 (the
+  -- bottom-left playable pad) plays right_split_base_note; +1 semitone per
+  -- column to the right, +5 semitones (a fourth) per row up. This is the
+  -- LinnStrument's own standard "Fourths" layout, just computed by us
+  -- instead of the hardware (see header comment for why).
+  right_split_base_note = 34, -- A#1 (matches the LinnStrument 200's default Fourths layout, confirmed against Bruce's reference chart)
+
+  -- ---- MPE output channels ----
+  -- Standard MPE convention: channel 1 is the zone's "master" channel
+  -- (reserved -- not used for notes here) and channels 2-16 are "member"
+  -- channels, one per simultaneously-held note. Both Nymphes and the
+  -- Micromonsta 2 have their own MPE support and are expected to auto-detect
+  -- the zone from incoming data, so we don't send a formal MPE Configuration
+  -- Message (RPN 6) -- just note/expression data on member channels.
+  mpe_master_channel = 1,
+  mpe_member_channels = {2,3,4,5,6,7,8,9,10,11,12,13,14,15,16},
+  _mpe_free_channels = {}, -- populated by _mpe_reset_channels; front = next to hand out
+
+  -- Note Lights: which pitch classes (relative to C=0) count as "in scale"
+  -- and stay lit; everything else goes dark, matching the LinnStrument's
+  -- own native Note Lights behavior. Major scale, root C.
+  right_split_scale = {[0]=true,[2]=true,[4]=true,[5]=true,[7]=true,[9]=true,[11]=true},
+
+  -- ---- output device select (column 17) ----
+  -- One pad = one output device, numbered by SLOT (1-8) starting at the TOP
+  -- of the instrument and counting down -- slot 1 is the topmost pad in
+  -- column 17, slot 8 the bottommost. This is the opposite direction from
+  -- "row" elsewhere in this file (row 1 = bottom, matching the MIDI channel
+  -- convention the note/pitch code uses) -- see _select_output_device and
+  -- _light_select_column for the row<->slot conversion. Press a pad to make
+  -- that slot's device the target for everything played on columns 18+. A
+  -- slot with device_name = nil is a placeholder that isn't wired up yet --
+  -- pressing it does nothing (and its LED stays off) until a real device
+  -- name is set. device_name may also be a LIST of names instead of a single
+  -- string -- notes get sent to every device in the list at once (see slot 4).
+  -- Matches how Bruce wants these lined up against norns' own MIDI device
+  -- list: 1 = Nymphes, 2 = Micromonsta 2, with the iPad landing somewhere in
+  -- 3-8 once its bridge is wired up.
+  --   slot 1 (top):    Nymphes -- confirmed device name, connected directly via USB
+  --   slot 2:          Micromonsta 2 -- connected directly via USB. Exact
+  --                    device name confirmed via the live device list:
+  --                    "MicroMonsta 2" (capital M in Monsta, space before 2).
+  --   slot 3:          iPad -- not directly possible (both norns and the iPad
+  --                    are USB hosts); routed through a CME U6MIDI Pro on
+  --                    norns' side and a CME U2MIDI Pro + MIDI cables on the
+  --                    iPad's side. Set this slot's device_name to the
+  --                    U6MIDI Pro's exact name once that's wired up and
+  --                    confirmed via the device list.
+  --   slot 4:          Both Nymphes AND Micromonsta 2 together -- every note
+  --                    goes to both devices at once, same pitch, same
+  --                    allocated MPE channel number on each.
+  --   slots 5-8:       unused for now (device_name = nil); pads stay dark.
+  output_devices = {
+    {label = "Nymphes",      device_name = "Nymphes"},
+    {label = "Micromonsta 2",device_name = "MicroMonsta 2"},
+    {label = "iPad (via U6)",device_name = nil},
+    {label = "Both (Nymphes + Micromonsta 2)", device_name = {"Nymphes", "MicroMonsta 2"}},
+    {label = nil, device_name = nil},
+    {label = nil, device_name = nil},
+    {label = nil, device_name = nil},
+    {label = nil, device_name = nil},
+  },
+  current_output_slot = 1, -- defaults to Nymphes (slot 1, top pad) on load
+
+  -- track which (col,row) is currently sounding what: its computed pitch and
+  -- the MPE channel allocated to it, so note_off sends a matching note_off
+  -- on the same channel, expression data can find the right note by row, and
+  -- switching output devices knows exactly what to silence.
+  -- entries: {pitch=<num>, channel=<num>, col=<num>, row=<num>}
+  _right_split_active_notes = {},
+
+  -- cache of resolved device ids, keyed by device name (re-validated on each
+  -- lookup in case a device reconnects with a different id).
+  _device_id_cache = {},
+
+}
+
+function device:_init(vgrid,device_number)
+  self.vgrid = vgrid
+  self:_mpe_reset_channels()
+  self:_reset()
+end
+
+function device:_reset()
+  if self.init_device_msg then
+    midi.devices[self.midi_id]:send(self.init_device_msg)
+    print("msg")
+  end
+  self:_light_right_split()
+  self:_light_select_column()
+end
+
+-- Refill the pool of free MPE member channels (2-16) to full, discarding any
+-- outstanding allocation. Called on load and whenever we switch output
+-- devices (the device being left already got its notes explicitly turned
+-- off in _all_notes_off_current_output, so its channel assignments are moot).
+function device:_mpe_reset_channels()
+  self._mpe_free_channels = {}
+  for i = #self.mpe_member_channels, 1, -1 do
+    table.insert(self._mpe_free_channels, self.mpe_member_channels[i])
+  end
+end
+
+-- Hand out the next free MPE member channel, or nil if all are in use (up to
+-- 15 simultaneous notes -- far more than this split can physically produce
+-- at once, but handled safely rather than assumed impossible).
+function device:_mpe_alloc_channel()
+  return table.remove(self._mpe_free_channels)
+end
+
+function device:_mpe_free_channel(ch)
+  if ch then
+    table.insert(self._mpe_free_channels, ch)
+  end
+end
+
+-- Paint static LEDs across the right split's playable columns (18+) matching
+-- the LinnStrument's own default "Note Lights" look for a Fourths layout:
+-- the root/C pad in each octave lit cyan (LinnStrument's default accent
+-- color), other in-scale pads lit blue, out-of-scale pads dark. Sent once
+-- here (not redrawn every refresh) since this layout is static -- it only
+-- needs to be reasserted when the device resets, same as the left split's
+-- grid LEDs.
+--
+-- NOTE on the row target below: this is deliberately NOT the same "9-row-1"
+-- flip _update_led uses for the left split. That flip exists because vgrid's
+-- row coordinate (y) counts row 1 as the TOP row. Here, "row" instead means
+-- the same thing it means everywhere else in this file for the right split
+-- (1 = bottom = lowest pitch, matching the MIDI channel convention the pitch
+-- formula above is built on) -- so it needs to map straight to the device's
+-- row target (row-1) instead of being flipped, or the coloring ends up
+-- painted mirror-image top-to-bottom versus the pitches it was computed for.
+function device:_light_right_split()
+  local dev = midi.devices[self.midi_id]
+  if not dev then return end
+  for col = self.note_start_column, self.right_split_total_columns do
+    for row = 1, self.height do
+      local pitch = self.right_split_base_note + (col - self.note_start_column) + (row-1)*5
+      local pc = pitch % 12
+      local color
+      if pc == 0 then
+        color = 4 -- root (C): cyan
+      elseif self.right_split_scale[pc] then
+        color = 5 -- in scale: blue
+      else
+        color = 7 -- not in scale: off
+      end
+      dev:cc(20, col, 1)
+      dev:cc(21, row-1, 1)
+      dev:cc(22, color, 1)
+    end
+  end
+end
+
+-- Paint column 17 (the device-select column): the currently active output
+-- device's pad lit white, any other configured-but-not-selected pad lit
+-- green, and any pad with no device wired up yet left dark. Slot 1 (top) ..
+-- slot 8 (bottom) top-to-bottom, so slot = 9 - row (row 1 = bottom, per the
+-- MIDI channel convention used everywhere else in this file).
+function device:_light_select_column()
+  local dev = midi.devices[self.midi_id]
+  if not dev then return end
+  for row = 1, self.height do
+    local slot = 9 - row
+    local entry = self.output_devices[slot]
+    local color
+    if slot == self.current_output_slot then
+      color = 8 -- white: currently active output
+    elseif entry and entry.device_name then
+      color = 3 -- green: configured, available to switch to
+    else
+      color = 7 -- off: no device wired up for this slot yet
+    end
+    dev:cc(20, self.select_column, 1)
+    dev:cc(21, row-1, 1)
+    dev:cc(22, color, 1)
+  end
+end
+
+function device._update_led(self,x,y,z)
+  if midi.devices[self.midi_id] then
+    midi.devices[self.midi_id]:cc(20,x,1) -- row
+    midi.devices[self.midi_id]:cc(21,9-y-1,1) -- col
+    midi.devices[self.midi_id]:cc(22,self.brightness_map[z+1],1) -- brightness
+  end
+end
+
+-- Resolve a MIDI output device by exact name, preferring a cached id (re-
+-- checked in case it's gone stale or now points at a different device after
+-- a reconnect) and falling back to a fresh scan of midi.devices.
+function device:_resolve_device_by_name(name)
+  if not name then return nil end
+  local cached_id = self._device_id_cache[name]
+  if cached_id and midi.devices[cached_id] and midi.devices[cached_id].name == name then
+    return midi.devices[cached_id]
+  end
+  for id, dev in pairs(midi.devices) do
+    if dev.name == name then
+      self._device_id_cache[name] = id
+      return dev
+    end
+  end
+  return nil
+end
+
+-- The MIDI device(s) the right split is currently routed to, per whichever
+-- slot was last selected in column 17. Always returns a list (possibly
+-- empty) -- entry.device_name may be a single name or a list of names (see
+-- output_devices above), and either way every resolved device gets included.
+function device:_get_current_outputs()
+  local entry = self.output_devices[self.current_output_slot]
+  if not entry or not entry.device_name then return {} end
+  local names = entry.device_name
+  if type(names) == "string" then names = {names} end
+  local outs = {}
+  for _, name in ipairs(names) do
+    local dev = self:_resolve_device_by_name(name)
+    if dev then
+      table.insert(outs, dev)
+    else
+      print("output device not found:", name)
+    end
+  end
+  return outs
+end
+
+-- Silence whatever's currently routed, before switching away from it: an
+-- explicit note_off (on each note's own allocated channel) for everything
+-- this script thinks is still held, plus a CC 123 All Notes Off on every
+-- member channel as a broader safety net for anything it lost track of.
+-- Always clears the active-notes table and resets the channel pool
+-- regardless, since those notes/allocations no longer apply to whatever's
+-- about to become current.
+function device:_all_notes_off_current_output()
+  local outs = self:_get_current_outputs()
+  for _, out in ipairs(outs) do
+    for _, entry in pairs(self._right_split_active_notes) do
+      out:note_off(entry.pitch, 0, entry.channel)
+    end
+    for _, ch in ipairs(self.mpe_member_channels) do
+      out:cc(123, 0, ch)
+    end
+  end
+  self._right_split_active_notes = {}
+  self:_mpe_reset_channels()
+end
+
+-- Handle a press on column 17 (row = midi_msg.ch, 1 = bottom): convert to a
+-- slot (1 = top pad .. 8 = bottom pad) and switch the right split's output
+-- to that slot's device, silencing the device being left first.
+function device:_select_output_device(row)
+  local slot = 9 - row
+  local entry = self.output_devices[slot]
+  if not entry or not entry.device_name then
+    print("device-select: slot "..tostring(slot).." has no device configured, ignoring")
+    return
+  end
+  if slot == self.current_output_slot then return end
+  self:_all_notes_off_current_output()
+  self.current_output_slot = slot
+  print("output device switched to", entry.label)
+  self:_light_select_column()
+end
+
+-- Handle a note_on/note_off whose column falls past the device-select
+-- column (i.e. the RIGHT split's playable pads), using the raw column
+-- (note) + row (channel) to compute a 4ths-tuned pitch, allocating that
+-- note its own MPE member channel, and sending both to every device the
+-- currently-selected slot is routed to (usually one, sometimes several --
+-- see slot 4's "both at once" combo).
+function device:_handle_right_split_note(midi_msg)
+  local outs = self:_get_current_outputs()
+  print("right split ->", #outs, "device(s)", "col", midi_msg.note, "row", midi_msg.ch)
+  if #outs == 0 then return end
+
+  local col, row = midi_msg.note, midi_msg.ch
+  local key = col.."_"..row
+  if midi_msg.type == 'note_on' then
+    local pitch = self.right_split_base_note + (col - self.note_start_column) + (row-1)*5
+    pitch = math.max(0, math.min(127, pitch))
+    local channel = self:_mpe_alloc_channel()
+    if not channel then
+      print("MPE: no free channel, dropping note col", col, "row", row)
+      return
+    end
+    self._right_split_active_notes[key] = {pitch=pitch, channel=channel, col=col, row=row}
+    for _, out in ipairs(outs) do
+      out:note_on(pitch, midi_msg.vel or 100, channel)
+    end
+  else
+    local entry = self._right_split_active_notes[key]
+    if entry then
+      for _, out in ipairs(outs) do
+        out:note_off(entry.pitch, midi_msg.vel or 0, entry.channel)
+      end
+      self:_mpe_free_channel(entry.channel)
+      self._right_split_active_notes[key] = nil
+    end
+  end
+end
+
+-- Pitch bend / channel pressure / poly key pressure arriving from the
+-- LinnStrument, on channel = row (see the big limitation note at the top of
+-- this file). For now this only LOGS what comes in rather than forwarding
+-- it: norns' midi.to_msg() field names/ranges for these message types
+-- haven't been confirmed against Bruce's actual hardware yet (unlike
+-- note_on/note_off/cc, which this file has used successfully throughout),
+-- and guessing wrong here risks a runtime error the moment a pad is pressed
+-- with pressure or slid mid-performance -- exactly the kind of mistake this
+-- whole debugging session has been trying to avoid (see the abandoned NRPN
+-- attempt earlier). Once we've seen real logged data, this gets filled in
+-- to translate row -> whichever active note(s) are on that row and send the
+-- equivalent message on their allocated channel(s) to the current output.
+function device:_handle_right_split_expression(midi_msg)
+  print("right split expression:", midi_msg.type, "ch", midi_msg.ch,
+        "val", midi_msg.val, "bend", midi_msg.bend, "note", midi_msg.note)
+end
+
+function device.event(self,vgrid,event)
+
+  local midi_msg = midi.to_msg(event)
+
+  print(midi_msg.type, midi_msg.ch, midi_msg.note, midi_msg.vel)
+
+  if (midi_msg.type == 'note_on' or midi_msg.type == 'note_off') then
+    if midi_msg.note == self.select_column then
+      -- device-select column: only act on note_on (a "press"), row = channel
+      if midi_msg.type == 'note_on' then
+        self:_select_output_device(midi_msg.ch)
+      end
+      return
+    end
+
+    if midi_msg.note and midi_msg.note >= self.note_start_column then
+      -- RIGHT split, arriving as raw column/row data (see header comment).
+      self:_handle_right_split_note(midi_msg)
+      return
+    end
+
+    local state = (midi_msg.type == 'note_on') and 1 or 0
+    local x = midi_msg.note
+    local y = midi_msg.ch
+    if key then
+      self._key_callback(self.current_quad,x,9-y,state)
+    end
+    return
+  end
+
+  if midi_msg.type == 'pitchbend' or midi_msg.type == 'channel_pressure' or midi_msg.type == 'key_pressure' then
+    self:_handle_right_split_expression(midi_msg)
+    return
+  end
+
+  -- Any other message type on a channel outside this device's grid mapping:
+  -- not currently translated for the right split -- kept here in case some
+  -- other setup still produces genuinely out-of-range channels. Follows
+  -- whichever output device is currently selected, same as notes.
+  if midi_msg.ch and (midi_msg.ch < 1 or midi_msg.ch > self.height) then
+    for _, out in ipairs(self:_get_current_outputs()) do
+      out:send(event)
+    end
+  end
+end
+
+device._key_callback = function() print('no vgrid event handle callback attached!') end
+
+function device:refresh(quad)
+  if quad.id == 1 then
+    local force = self.force_full_refresh
+    for x = 1,self.width do
+      for y = 1,self.height do
+        if x <= 8 then
+          if force or self.vgrid.quads[1].buffer[x][y] ~= prevBuffer1[x][y] then
+            self._update_led(self,x,y,self.vgrid.quads[1].buffer[x][y])
+            prevBuffer1[x][y] = self.vgrid.quads[1].buffer[x][y]
+          end
+        else
+          if force or self.vgrid.quads[2].buffer[x-8][y] ~= prevBuffer2[x-8][y] then
+            self._update_led(self,x,y,self.vgrid.quads[2].buffer[x-8][y])
+            prevBuffer2[x-8][y] = self.vgrid.quads[2].buffer[x-8][y]
+          end
+        end
+      end
+    end
+    if force then self.force_full_refresh = false end
+  end
+end
+
+return device
