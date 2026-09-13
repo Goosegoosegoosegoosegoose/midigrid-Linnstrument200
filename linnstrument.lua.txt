@@ -28,10 +28,13 @@
 --      bend / pressure on one note doesn't affect others -- as long as they
 --      land on different physical rows (see the big note below).
 --   6. Pitch bend / channel pressure / poly key pressure arriving from the
---      LinnStrument are, for now, only logged (see _handle_right_split_expression)
---      rather than forwarded, so we can confirm the exact message shape norns
---      produces for these before wiring up real translation -- see the
---      comment on that function for why.
+--      LinnStrument are now translated and forwarded to the current output
+--      device(s), on whichever note(s) they apply to's own allocated MPE
+--      channel -- see _handle_right_split_expression for exactly how each
+--      message type is resolved to a note, and its header comment for the
+--      norns midi field names/ranges this was built against (confirmed
+--      2026-09 against norns' lua/core/midi.lua source; earlier logging
+--      here had guessed a wrong field name for pitchbend).
 --
 -- Why #2 is necessary: midigrid requires the LinnStrument's "User Firmware
 -- Mode" to be on so that the LEFT split's raw column/row data (channel=row,
@@ -56,10 +59,17 @@
 -- which is typical in a 4ths-tuning layout) gets fully independent per-note
 -- expression, by routing that row's incoming data to whichever note is
 -- currently active on it. Two notes held on the SAME row at once can't be
--- told apart at the input level -- the hardware simply doesn't say which of
--- the two a slide belongs to -- so both would receive the same incoming
--- value in that case. This is a hard limit of the raw UFM data, not
--- something fixable in software.
+-- told apart at the input level for pitchbend/channel_pressure -- the
+-- hardware simply doesn't say which of the two a slide belongs to -- so
+-- both would receive the same incoming value in that case. This is a hard
+-- limit of the raw UFM data, not something fixable in software.
+--
+-- The one exception is poly key pressure (aftertouch): unlike pitch bend
+-- and channel pressure, MIDI key_pressure messages DO carry a note number,
+-- so if your LinnStrument is set to send Z as poly (key) pressure rather
+-- than channel pressure, same-row notes get told apart correctly even
+-- though pitch bend/channel pressure can't be. Whichever your hardware is
+-- actually sending is handled -- see _handle_right_split_expression.
 --
 -- Also paints static LEDs across the right split matching the LinnStrument's
 -- own native Note Lights behavior for this layout (root/C = cyan, other
@@ -413,21 +423,65 @@ function device:_handle_right_split_note(midi_msg)
   end
 end
 
--- Pitch bend / channel pressure / poly key pressure arriving from the
--- LinnStrument, on channel = row (see the big limitation note at the top of
--- this file). For now this only LOGS what comes in rather than forwarding
--- it: norns' midi.to_msg() field names/ranges for these message types
--- haven't been confirmed against Bruce's actual hardware yet (unlike
--- note_on/note_off/cc, which this file has used successfully throughout),
--- and guessing wrong here risks a runtime error the moment a pad is pressed
--- with pressure or slid mid-performance -- exactly the kind of mistake this
--- whole debugging session has been trying to avoid (see the abandoned NRPN
--- attempt earlier). Once we've seen real logged data, this gets filled in
--- to translate row -> whichever active note(s) are on that row and send the
--- equivalent message on their allocated channel(s) to the current output.
+-- Forward pitch bend / channel pressure / poly key pressure arriving from
+-- the LinnStrument's right split to whichever currently-held note(s) it
+-- applies to, on that note's own allocated MPE member channel, on the
+-- currently selected output device(s) -- true per-note MPE expression,
+-- subject to the row-granularity limitation documented at the top of this
+-- file.
+--
+-- Field names/ranges below are confirmed (2026-09) against norns'
+-- lua/core/midi.lua source, both for what midi.to_msg() hands us and for
+-- the matching dev:*() send methods:
+--   pitchbend:         to_msg -> {type, val (14-bit, 0-16383, center 8192), ch}
+--                       dev:pitchbend(val, ch)
+--   channel_pressure:  to_msg -> {type, val (0-127), ch}
+--                       dev:channel_pressure(val, ch)
+--   key_pressure:      to_msg -> {type, note, val (0-127), ch}
+--                       dev:key_pressure(note, val, ch)
+-- (NOTE: an earlier version of this file logged midi_msg.bend -- that field
+-- does not exist on any of these message types; it's .val throughout. If
+-- you see nil values logged anywhere below, that's the tell this drifted
+-- from the real norns API again -- re-check against core/midi.lua rather
+-- than guessing.)
+--
+-- key_pressure carries an explicit note number (col) as well as channel
+-- (row), so unlike pitchbend/channel_pressure it can be routed to the exact
+-- held note even when two notes share a row -- IF your LinnStrument's Z
+-- (pressure) setting is sending poly/key pressure rather than channel
+-- pressure. Whichever your hardware actually sends, this handles it: test
+-- by pressing/sliding a held pad and watching the norns matron log (or
+-- maiden) for which message type prints below, then confirm the resulting
+-- MPE behavior on the synth matches what you expect for that type.
 function device:_handle_right_split_expression(midi_msg)
-  print("right split expression:", midi_msg.type, "ch", midi_msg.ch,
-        "val", midi_msg.val, "bend", midi_msg.bend, "note", midi_msg.note)
+  local outs = self:_get_current_outputs()
+  if #outs == 0 then return end
+
+  if midi_msg.type == 'key_pressure' then
+    local key = midi_msg.note.."_"..midi_msg.ch
+    local entry = self._right_split_active_notes[key]
+    if not entry then return end
+    for _, out in ipairs(outs) do
+      out:key_pressure(entry.pitch, midi_msg.val, entry.channel)
+    end
+    return
+  end
+
+  -- pitchbend / channel_pressure: channel-wide (no note number), so apply
+  -- to every note currently held on this row (usually just one -- see the
+  -- same-row limitation note above).
+  local row = midi_msg.ch
+  for _, entry in pairs(self._right_split_active_notes) do
+    if entry.row == row then
+      for _, out in ipairs(outs) do
+        if midi_msg.type == 'pitchbend' then
+          out:pitchbend(midi_msg.val, entry.channel)
+        elseif midi_msg.type == 'channel_pressure' then
+          out:channel_pressure(midi_msg.val, entry.channel)
+        end
+      end
+    end
+  end
 end
 
 function device.event(self,vgrid,event)
