@@ -25,31 +25,95 @@
 --   5. True per-note MPE on the right split: each held note is assigned its
 --      own MIDI output channel (dynamically, from a pool of 2-16, freed on
 --      release) instead of all notes sharing one fixed channel, so pitch
---      bend / pressure on one note doesn't affect others -- as long as they
---      land on different physical rows (see the big note below).
---   6. Pitch bend / channel pressure / poly key pressure arriving from the
---      LinnStrument are now translated and forwarded to the current output
---      device(s), on whichever note(s) they apply to's own allocated MPE
---      channel -- see _handle_right_split_expression for exactly how each
---      message type is resolved to a note, and its header comment for the
---      norns midi field names/ranges this was built against (confirmed
---      2026-09 against norns' lua/core/midi.lua source; earlier logging
---      here had guessed a wrong field name for pitchbend).
+--      bend / pressure on one note doesn't affect others.
+--   6. Pitch bend / timbre / poly key pressure arriving from the
+--      LinnStrument are translated and forwarded to the current output
+--      device(s), on whichever note they apply to's own allocated MPE
+--      channel.
 --   7. Turned out #6 alone wasn't enough: User Firmware Mode doesn't send
 --      ANY continuous data (pitch bend/timbre/pressure) per row until it's
 --      explicitly activated for that row via CC 9-12 sent TO the
---      LinnStrument (confirmed against the LinnStrument firmware source --
---      see _activate_continuous_data). Without this, #6's forwarding logic
---      was correct but had nothing to forward -- notes and velocity worked
---      fine, but no expression ever arrived, which is exactly what testing
---      on real hardware showed (2026-09) before this was found.
---   8. Third MPE dimension: incoming Y/timbre (always CC74 from the
---      LinnStrument) is now forwarded too, as whichever CC number
---      right_split_timbre_cc names, on the note's own MPE channel -- see
---      that field's comment for why the outgoing CC is configurable
---      (Dreadbox documents CC74 on the Nymphes as a hardwired filter
---      cutoff control, not a generic timbre input; untested whether that
---      or CC1/mod wheel behaves better per-note under MPE).
+--      LinnStrument (see _activate_continuous_data). Without this, #6's
+--      forwarding logic was correct but had nothing to forward -- notes and
+--      velocity worked fine, but no expression ever arrived.
+--   8. Third MPE dimension: incoming Y/timbre is now forwarded too, as
+--      whichever CC number right_split_timbre_cc names, on the note's own
+--      MPE channel -- see that field's comment for why the outgoing CC is
+--      configurable (Dreadbox documents CC74 on the Nymphes as a hardwired
+--      filter cutoff control, not a generic timbre input; untested whether
+--      that or CC1/mod wheel behaves better per-note under MPE).
+--   9. CORRECTED 2026-09: after activating X per-row (CC10) still produced
+--      no pitch bend on real hardware -- confirmed via the matron log
+--      showing Y (cc) and Z (key_pressure) arriving fine but literally no
+--      `pitchbend` line ever printing, even after manually re-sending the
+--      CC9-12 activation batch live from the REPL -- #6/#7's assumption
+--      that User Firmware Mode reports X (pitch) as a standard MIDI
+--      pitchbend message, and Y (timbre) as a fixed CC74, turned out to be
+--      WRONG. Verified this time directly against the actual firmware
+--      source (github.com/rogerlinndesign/linnstrument-firmware,
+--      ls_handleTouches.ino + ls_midi.ino + user_firmware_mode.md), not
+--      just asserted:
+--        Z (pressure): midiSendPolyPressure(note=column, channel=row) --
+--          this part WAS right; it's genuinely poly (key) pressure, which
+--          is exactly why it kept working through all of this.
+--        X (pitch):    midiSendControlChange14BitUserFirmware(column,
+--          column+32, positionX, channel=row) -- sent as a 14-bit CC PAIR
+--          (MSB on CC 0-25, LSB on CC 32-57, LSB sent first), NOT a
+--          pitchbend message at all. positionX is an ABSOLUTE position
+--          across the whole board (0-4265 on a LinnStrument 200), already
+--          including the note's starting reference position baked in by
+--          the firmware -- there is no native "bend amount" to read off
+--          directly, so we compute one ourselves as a delta from whatever
+--          positionX reads the instant the note goes down.
+--        Y (timbre):   midiSendControlChange(column+64, value, channel=row)
+--          -- CC 64-89, keyed by column, NOT a fixed CC74. Under the old
+--          code, two notes on the same row silently shared one CC74 stream,
+--          and any column that didn't happen to map to CC74 was silently
+--          dropped; every column now gets its own correctly-routed value.
+--      Net effect: X and Y are actually PER-COLUMN (per-note) in this
+--      protocol, same as Z -- there is no same-row ambiguity for any of the
+--      three. See _handle_right_split_x_cc / _handle_right_split_y_cc /
+--      _handle_right_split_expression, and right_split_bend_range_semitones
+--      / right_split_x_sensitivity below for the two tunable numbers this
+--      depends on.
+--   10. Two more fixes, 2026-09:
+--       a. Columns 18-20's Note Lights kept coming out wrong on reset --
+--          traced to _reset() firing the init_device_msg SysEx (a full
+--          UFM mode-switch) and then immediately following it with ~200
+--          more CC messages back-to-back for continuous-data activation
+--          and note-light painting, no pause at all. That outran the
+--          LinnStrument's own processing of the SysEx and dropped some of
+--          the earliest CCs -- which happen to be exactly columns 18-20,
+--          the first ones _light_right_split() paints. Fixed by running
+--          _reset() as a clock coroutine with small clock.sleep() pauses
+--          between each burst.
+--       b. Right-split pads now flash red (color 1) while held, restoring
+--          to their normal Note Lights color (root/scale/off) on release --
+--          see _set_right_split_led, _right_split_static_color, and the
+--          note-on/off branches of _handle_right_split_note.
+--   11. Legato slide across column boundaries, 2026-09: sliding a held
+--       finger across several columns without lifting was retriggering a
+--       brand-new note (new MPE channel, new x_baseline) at every column
+--       crossed, producing a stepped run of little retriggered blips
+--       instead of one smooth glide -- confirmed a significant part of how
+--       this instrument is actually played, so worth fixing properly
+--       rather than leaving as a known limitation. Real hardware logs
+--       showed the LinnStrument sends "make before break": the new
+--       column's note_on arrives BEFORE the old column's note_off. Using
+--       that, _handle_right_split_note now checks, on every note_on, for
+--       an already-held note on the IMMEDIATELY ADJACENT column of the
+--       same row -- if found, this is treated as a continuation of that
+--       same voice (aliased onto the same entry, tracked via entry.cols)
+--       rather than a new attack: no new channel, no new synth note-on,
+--       and critically no new x_baseline, so pitch bend keeps accumulating
+--       from wherever the gesture actually started, all the way across
+--       however many columns get crossed. The synth only gets a real
+--       note-off once every column involved in the slide has been
+--       released. right_split_legato_slide can be set false to go back to
+--       strict per-column retriggering. Known tradeoff: this can't
+--       perfectly distinguish a slide from a deliberately pressed second
+--       note one column away (e.g. a tight dyad) -- see the comment inline
+--       in _handle_right_split_note.
 --
 -- Why #2 is necessary: midigrid requires the LinnStrument's "User Firmware
 -- Mode" to be on so that the LEFT split's raw column/row data (channel=row,
@@ -63,28 +127,6 @@
 -- past the grid's width and build our own note from it, using a 4ths-tuning
 -- layout (like the LinnStrument's own default tuning): +1 semitone per
 -- column, +5 semitones (a perfect fourth) per row.
---
--- IMPORTANT LIMITATION for #5/#6: because User Firmware Mode forces the
--- WHOLE board into that same raw encoding, the LinnStrument's continuous
--- data (pitch bend, pressure) can only ever arrive at per-ROW granularity --
--- channel = row, no note number attached, since pitch bend and channel
--- pressure are inherently channel-wide MIDI messages, not per-note ones.
--- That's true for both splits alike. So: one note per row at a time (the
--- common case -- one finger per row, or chords that span different rows,
--- which is typical in a 4ths-tuning layout) gets fully independent per-note
--- expression, by routing that row's incoming data to whichever note is
--- currently active on it. Two notes held on the SAME row at once can't be
--- told apart at the input level for pitchbend/channel_pressure -- the
--- hardware simply doesn't say which of the two a slide belongs to -- so
--- both would receive the same incoming value in that case. This is a hard
--- limit of the raw UFM data, not something fixable in software.
---
--- The one exception is poly key pressure (aftertouch): unlike pitch bend
--- and channel pressure, MIDI key_pressure messages DO carry a note number,
--- so if your LinnStrument is set to send Z as poly (key) pressure rather
--- than channel pressure, same-row notes get told apart correctly even
--- though pitch bend/channel pressure can't be. Whichever your hardware is
--- actually sending is handled -- see _handle_right_split_expression.
 --
 -- Also paints static LEDs across the right split matching the LinnStrument's
 -- own native Note Lights behavior for this layout (root/C = cyan, other
@@ -130,6 +172,13 @@ local device={
 
   current_quad = 1,
 
+  -- Set true to log every incoming MIDI message (type/channel/note/cc/val)
+  -- to the matron console -- invaluable for debugging (this is how the
+  -- 2026-09 pitch bend investigation got solved) but noisy and adds console
+  -- overhead during actual performance, especially during slides, which
+  -- generate a lot of CC traffic. Leave false for normal use.
+  debug_midi = false,
+
   -- ---- right-split layout ----
   -- Column 17 is the dedicated device-select control (see output_devices
   -- below); playable notes start one column further right than before.
@@ -160,18 +209,64 @@ local device={
   -- own native Note Lights behavior. Major scale, root C.
   right_split_scale = {[0]=true,[2]=true,[4]=true,[5]=true,[7]=true,[9]=true,[11]=true},
 
-  -- ---- right-split timbre (Y-axis / CC74) ----
-  -- The LinnStrument sends Y (timbre) as CC74, the standard MPE convention
-  -- -- that part isn't configurable, it's what arrives. What IS configurable
-  -- is which CC number gets sent OUT to the synth, because CC74's actual
-  -- behavior varies by manufacturer: per Dreadbox's own published CC list,
-  -- CC74 on the Nymphes is hardwired to "LPF cutoff" specifically, not a
-  -- generic assignable "timbre" input the way some MPE synths treat it. If
-  -- that doesn't produce the effect you want -- or doesn't respond per-note
-  -- the way pitch bend/pressure do -- try 1 (mod wheel), which Nymphes
-  -- supports as a separately assignable modulation source in its own mod
-  -- matrix. Change this one number; no other code changes needed.
+  -- ---- right-split timbre (Y-axis) ----
+  -- Under User Firmware Mode the LinnStrument sends Y (timbre) as a plain
+  -- 7-bit CC per column (CC 64-89, see patch #9 above and
+  -- _handle_right_split_y_cc) -- what IS configurable is which CC number
+  -- gets sent OUT to the synth, because CC74's actual behavior varies by
+  -- manufacturer: per Dreadbox's own published CC list, CC74 on the Nymphes
+  -- is hardwired to "LPF cutoff" specifically, not a generic assignable
+  -- "timbre" input the way some MPE synths treat it. If that doesn't
+  -- produce the effect you want -- or doesn't respond per-note the way
+  -- pitch bend/pressure do -- try 1 (mod wheel), which Nymphes supports as
+  -- a separately assignable modulation source in its own mod matrix. Change
+  -- this one number; no other code changes needed.
   right_split_timbre_cc = 74,
+
+  -- ---- right-split pitch bend (X-axis) ----
+  -- Under User Firmware Mode the LinnStrument does NOT send a MIDI pitch
+  -- bend message for X -- it sends a 14-bit ABSOLUTE board position (see
+  -- patch #9 above), which we turn into a bend value ourselves as a delta
+  -- from wherever that position reads the instant a note goes down.
+  --
+  -- right_split_bend_range_semitones MUST match whatever pitch bend range
+  -- the receiving synth is configured for (confirmed 2026-09: Nymphes set
+  -- to 48 semitones under MPE) -- otherwise the bend math here and the
+  -- synth's own interpretation of the incoming pitchbend value disagree,
+  -- and the pitch shift will read as too large or too small versus how far
+  -- you actually moved your finger. If you switch the current output slot
+  -- to a synth with a different configured bend range, update this to
+  -- match (a future improvement would be making this per-output-device
+  -- instead of global).
+  right_split_bend_range_semitones = 48,
+
+  -- How many raw X units equal one column-width (== one semitone in this
+  -- split's 4ths tuning). Derived from the LinnStrument 200's documented
+  -- full-width range of 0-4265 across its 25 column-to-column spans
+  -- (4265/25 ~= 170.6) -- this is a "feel" knob more than a precise
+  -- physical constant, so if slides feel over- or under-sensitive versus
+  -- how far you physically moved your finger, adjust this number rather
+  -- than the bend range above (which needs to stay matched to the synth).
+  right_split_x_sensitivity = 170.6,
+
+  -- Treat a slide across a column boundary (without lifting) as one
+  -- continuous glide -- same held note, pitch bend accumulating from
+  -- wherever the gesture started -- instead of retriggering a brand-new
+  -- note at every column crossed. See patch #11 at the top of this file
+  -- and _handle_right_split_note. Set false to go back to strict
+  -- per-column retriggering (every column is always its own discrete note).
+  right_split_legato_slide = true,
+
+  -- ---- right-split octave shift (column 17, slots 5-8) ----
+  -- Maps a column-17 SLOT (see the output-device-select comment below for
+  -- what "slot" means) to a fixed octave shift in semitones-times-12.
+  -- Pressing one of these applies +/- that many octaves to every note
+  -- played AFTER the press (see _handle_right_split_note's pitch
+  -- calculation and _select_octave_preset) -- notes already held are
+  -- unaffected, same as the real LinnStrument's own octave buttons.
+  -- Pressing the currently-active preset again resets to no shift (0).
+  right_split_octave_presets = {[5]=2, [6]=1, [7]=-1, [8]=-2},
+  right_split_octave_shift = 0, -- current shift in octaves; 0 = none
 
   -- ---- output device select (column 17) ----
   -- One pad = one output device, numbered by SLOT (1-8) starting at the TOP
@@ -201,7 +296,11 @@ local device={
   --   slot 4:          Both Nymphes AND Micromonsta 2 together -- every note
   --                    goes to both devices at once, same pitch, same
   --                    allocated MPE channel number on each.
-  --   slots 5-8:       unused for now (device_name = nil); pads stay dark.
+  --   slots 5-8:       NOT device slots -- repurposed as the right split's
+  --                    octave-preset buttons (+2/+1/-1/-2), see
+  --                    right_split_octave_presets below. Their entries here
+  --                    (device_name = nil) are unused placeholders kept
+  --                    only so this table still has all 8 slots.
   output_devices = {
     {label = "Nymphes",      device_name = "Nymphes"},
     {label = "Micromonsta 2",device_name = "MicroMonsta 2"},
@@ -214,12 +313,26 @@ local device={
   },
   current_output_slot = 1, -- defaults to Nymphes (slot 1, top pad) on load
 
-  -- track which (col,row) is currently sounding what: its computed pitch and
-  -- the MPE channel allocated to it, so note_off sends a matching note_off
-  -- on the same channel, expression data can find the right note by row, and
-  -- switching output devices knows exactly what to silence.
-  -- entries: {pitch=<num>, channel=<num>, col=<num>, row=<num>}
+  -- track which (col,row) is currently sounding what: its computed pitch,
+  -- the MPE channel allocated to it, and (once the first X reading arrives
+  -- after note-on) x_baseline -- the raw absolute X position treated as
+  -- this note's own zero-bend reference point, so later X readings for the
+  -- same column+row become a bend delta rather than an absolute position.
+  -- During a legato slide (see patch #11 and right_split_legato_slide),
+  -- MULTIPLE keys ("col_row" for each column the slide has touched) can
+  -- point to the exact same entry table -- cols tracks which columns are
+  -- still aliased to it, so the synth only gets a real note-off once every
+  -- column involved has been released, and x_baseline is never reset
+  -- mid-slide, keeping the whole gesture as one continuous glide.
+  -- entries: {pitch=<num>, channel=<num>, col=<num>, row=<num>, x_baseline=<num-or-nil>, cols={[col]=true, ...}}
   _right_split_active_notes = {},
+
+  -- pending half-received X CC pairs, keyed the same way as
+  -- _right_split_active_notes ("col_row"): {msb=<0-127-or-nil>, lsb=<0-127-or-nil>}.
+  -- See _handle_right_split_x_cc -- the MSB and LSB of a column's 14-bit X
+  -- reading arrive as two separate CC messages, so we hold onto whichever
+  -- half showed up first until its pair completes the picture.
+  _right_split_x_pending = {},
 
   -- cache of resolved device ids, keyed by device name (re-validated on each
   -- lookup in case a device reconnects with a different id).
@@ -249,30 +362,40 @@ function device:_init(vgrid,device_number)
 end
 
 function device:_reset()
-  if self.init_device_msg then
-    midi.devices[self.midi_id]:send(self.init_device_msg)
-    print("msg")
-  end
-  self:_activate_continuous_data()
-  self:_light_right_split()
-  self:_light_select_column()
+  -- Run as a clock coroutine so we can pause between the big MIDI bursts
+  -- below (clock.sleep needs a coroutine context, which a plain function
+  -- call from midigrid's device:_init() is not). Fixes a 2026-09 bug where
+  -- columns 18-20's Note Lights consistently came out wrong -- exactly the
+  -- first few cells painted by _light_right_split(), right after the
+  -- init_device_msg SysEx (which switches the whole board in/out of User
+  -- Firmware Mode) -- while sending ~200 more CC messages immediately
+  -- back-to-back with no pause apparently outran the LinnStrument's own
+  -- processing of that SysEx and dropped some of the earliest ones.
+  clock.run(function()
+    if self.init_device_msg then
+      midi.devices[self.midi_id]:send(self.init_device_msg)
+      print("msg")
+    end
+    clock.sleep(0.1)
+    self:_activate_continuous_data()
+    clock.sleep(0.05)
+    self:_light_right_split()
+    clock.sleep(0.05)
+    self:_light_select_column()
+  end)
 end
 
--- Turn on User Firmware Mode's per-row continuous-data output. Confirmed
--- (2026-09) against the LinnStrument firmware source (ls_midi.ino): under
--- UFM, X (pitch bend) / Y (timbre, CC74) / Z (pressure) reporting is a
--- separate per-row on/off flag from note on/off, and it does NOT default to
--- on -- nothing continuous is ever sent until this is explicitly turned on
--- for that row. This is exactly why _handle_right_split_expression never
--- fired despite normal playing: the LinnStrument was never told to start
--- sending anything continuous in the first place.
+-- Turn on User Firmware Mode's per-row continuous-data output. Under UFM, X
+-- (pitch) / Y (timbre) / Z (pressure) reporting is a separate per-row on/off
+-- flag from note on/off, and it does NOT default to on -- nothing continuous
+-- is ever sent until this is explicitly turned on for that row.
 --
 -- These are sent TO the LinnStrument itself (same midi_id device object
 -- used for the LED CCs above), one MIDI channel per row (channel = row,
 -- 1-8, matching the same row<->channel convention used everywhere else in
 -- this file):
---   CC 10, value 1 on channel <row>: activate X (pitch bend) for that row
---   CC 11, value 1 on channel <row>: activate Y (timbre / CC74) for that row
+--   CC 10, value 1 on channel <row>: activate X (pitch) for that row
+--   CC 11, value 1 on channel <row>: activate Y (timbre) for that row
 --   CC 12, value 1 on channel <row>: activate Z (pressure) for that row
 --   CC  9, value 1 on channel <row>: "slide mode" for that row -- exact
 --     behavior unconfirmed from the firmware source comments; included
@@ -288,7 +411,7 @@ function device:_activate_continuous_data()
   if not dev then return end
   for row = 1, self.height do
     dev:cc(9, 1, row)  -- slide mode (unconfirmed semantics -- see comment above)
-    dev:cc(10, 1, row) -- X / pitch bend active
+    dev:cc(10, 1, row) -- X / pitch active
     dev:cc(11, 1, row) -- Y / timbre active
     dev:cc(12, 1, row) -- Z / pressure active
   end
@@ -334,24 +457,39 @@ end
 -- formula above is built on) -- so it needs to map straight to the device's
 -- row target (row-1) instead of being flipped, or the coloring ends up
 -- painted mirror-image top-to-bottom versus the pitches it was computed for.
-function device:_light_right_split()
+-- The static Note Lights color a given right-split cell should show at
+-- rest (not currently pressed): root/C = cyan, other in-scale notes = blue,
+-- out-of-scale notes = off. Factored out of _light_right_split() so
+-- _handle_right_split_note can call the exact same logic to restore a
+-- cell's color after a red press-feedback flash (see _set_right_split_led).
+function device:_right_split_static_color(col, row)
+  local pitch = self.right_split_base_note + (col - self.note_start_column) + (row-1)*5
+  local pc = pitch % 12
+  if pc == 0 then
+    return 4 -- root (C): cyan
+  elseif self.right_split_scale[pc] then
+    return 5 -- in scale: blue
+  else
+    return 7 -- not in scale: off
+  end
+end
+
+-- Set a single right-split cell's LED to an explicit color (see
+-- brightness_map above for the color numbers). Used both for the initial
+-- static paint (_light_right_split) and for press feedback (note-on/off in
+-- _handle_right_split_note).
+function device:_set_right_split_led(col, row, color)
   local dev = midi.devices[self.midi_id]
   if not dev then return end
+  dev:cc(20, col, 1)
+  dev:cc(21, row-1, 1)
+  dev:cc(22, color, 1)
+end
+
+function device:_light_right_split()
   for col = self.note_start_column, self.right_split_total_columns do
     for row = 1, self.height do
-      local pitch = self.right_split_base_note + (col - self.note_start_column) + (row-1)*5
-      local pc = pitch % 12
-      local color
-      if pc == 0 then
-        color = 4 -- root (C): cyan
-      elseif self.right_split_scale[pc] then
-        color = 5 -- in scale: blue
-      else
-        color = 7 -- not in scale: off
-      end
-      dev:cc(20, col, 1)
-      dev:cc(21, row-1, 1)
-      dev:cc(22, color, 1)
+      self:_set_right_split_led(col, row, self:_right_split_static_color(col, row))
     end
   end
 end
@@ -361,19 +499,31 @@ end
 -- green, and any pad with no device wired up yet left dark. Slot 1 (top) ..
 -- slot 8 (bottom) top-to-bottom, so slot = 9 - row (row 1 = bottom, per the
 -- MIDI channel convention used everywhere else in this file).
+--
+-- Slots 5-8 are the octave-preset buttons instead (see
+-- right_split_octave_presets / _select_octave_preset): the currently
+-- active preset lit white, the other three lit yellow -- yellow rather
+-- than the green used for "available device" so the two groups of buttons
+-- read as visually distinct kinds of control, not as one long row of the
+-- same thing.
 function device:_light_select_column()
   local dev = midi.devices[self.midi_id]
   if not dev then return end
   for row = 1, self.height do
     local slot = 9 - row
-    local entry = self.output_devices[slot]
+    local octave_amount = self.right_split_octave_presets[slot]
     local color
-    if slot == self.current_output_slot then
-      color = 8 -- white: currently active output
-    elseif entry and entry.device_name then
-      color = 3 -- green: configured, available to switch to
+    if octave_amount then
+      color = (self.right_split_octave_shift == octave_amount) and 8 or 2 -- white if active, else yellow
     else
-      color = 7 -- off: no device wired up for this slot yet
+      local entry = self.output_devices[slot]
+      if slot == self.current_output_slot then
+        color = 8 -- white: currently active output
+      elseif entry and entry.device_name then
+        color = 3 -- green: configured, available to switch to
+      else
+        color = 7 -- off: no device wired up for this slot yet
+      end
     end
     dev:cc(20, self.select_column, 1)
     dev:cc(21, row-1, 1)
@@ -437,8 +587,15 @@ end
 -- about to become current.
 function device:_all_notes_off_current_output()
   local outs = self:_get_current_outputs()
+  -- Dedup by entry identity, not by key: during a legato slide (patch #11)
+  -- more than one "col_row" key can point at the exact same held-note
+  -- entry, and we only want one note-off per actual voice.
+  local unique_entries = {}
+  for _, entry in pairs(self._right_split_active_notes) do
+    unique_entries[entry] = true
+  end
   for _, out in ipairs(outs) do
-    for _, entry in pairs(self._right_split_active_notes) do
+    for entry, _ in pairs(unique_entries) do
       out:note_off(entry.pitch, 0, entry.channel)
     end
     for _, ch in ipairs(self.mpe_member_channels) do
@@ -446,6 +603,7 @@ function device:_all_notes_off_current_output()
     end
   end
   self._right_split_active_notes = {}
+  self._right_split_x_pending = {}
   self:_mpe_reset_channels()
 end
 
@@ -466,70 +624,225 @@ function device:_select_output_device(row)
   self:_light_select_column()
 end
 
+-- Handle a press on one of column 17's octave-preset pads (slots 5-8, see
+-- right_split_octave_presets). Pressing the currently-active preset again
+-- resets to no shift (0); pressing a different one replaces it. Only
+-- affects notes played from now on -- anything already held keeps
+-- sounding at its original pitch (see _handle_right_split_note).
+function device:_select_octave_preset(slot)
+  local amount = self.right_split_octave_presets[slot]
+  if not amount then return end
+  if self.right_split_octave_shift == amount then
+    self.right_split_octave_shift = 0
+  else
+    self.right_split_octave_shift = amount
+  end
+  print("right split octave shift ->", self.right_split_octave_shift)
+  self:_light_select_column()
+end
+
 -- Handle a note_on/note_off whose column falls past the device-select
 -- column (i.e. the RIGHT split's playable pads), using the raw column
 -- (note) + row (channel) to compute a 4ths-tuned pitch, allocating that
 -- note its own MPE member channel, and sending both to every device the
 -- currently-selected slot is routed to (usually one, sometimes several --
 -- see slot 4's "both at once" combo).
+--
+-- LEGATO SLIDE (patch #11): the LinnStrument sends "make before break"
+-- when a finger slides across a column boundary without lifting -- the new
+-- column's note_on arrives BEFORE the old column's note_off (confirmed
+-- 2026-09 from real hardware logs). So on every note_on, if there's
+-- already a held note on the IMMEDIATELY ADJACENT column of this same row,
+-- treat this as a continuation of that same voice rather than a new
+-- attack: alias this column onto the existing entry (entry.cols) instead
+-- of allocating a new channel or sending a new note-on, and critically
+-- don't touch its x_baseline -- pitch bend keeps accumulating from
+-- wherever the gesture actually started, so a slide across several
+-- columns becomes one continuous glide instead of a run of little
+-- retriggered blips. The synth only gets a real note-off once every column
+-- the slide touched has been released (see the note_off branch below).
+-- right_split_legato_slide = false restores strict per-column retriggering.
+--
+-- Known tradeoff: this can't perfectly distinguish "sliding finger" from
+-- "deliberately pressing a second, separate note one column away from an
+-- already-held one" (e.g. a tight dyad) -- both look identical at the raw
+-- column/row level we have to work with. In this 4ths-tuning layout,
+-- adjacent columns are only a semitone apart, so that's an uncommon chord
+-- voicing; if it turns out to matter in practice, this is the place to add
+-- a time-based check (e.g. only treat it as a slide if the adjacent note
+-- was touched within the last ~100ms).
+--
+-- PATCH 12 (2026-09): column 17's slots 5-8 (previously unused
+-- placeholders) are now four fixed octave-preset buttons for the right
+-- split -- see right_split_octave_presets, _select_octave_preset, and the
+-- note-on dispatch in device.event. Pressing an already-active preset
+-- toggles back to no shift (0); pressing a different one replaces
+-- whatever shift was active. Only affects notes played AFTER the press --
+-- anything already held keeps sounding at its original pitch, same as the
+-- real LinnStrument's own octave buttons. _light_select_column shows the
+-- active preset in white and the other three in yellow -- yellow rather
+-- than the green slots 1-4 use for "available device", specifically so the
+-- two button groups don't read as the same kind of control at a glance.
 function device:_handle_right_split_note(midi_msg)
   local outs = self:_get_current_outputs()
-  print("right split ->", #outs, "device(s)", "col", midi_msg.note, "row", midi_msg.ch)
+  if self.debug_midi then
+    print("right split ->", #outs, "device(s)", "col", midi_msg.note, "row", midi_msg.ch)
+  end
   if #outs == 0 then return end
 
   local col, row = midi_msg.note, midi_msg.ch
   local key = col.."_"..row
+
   if midi_msg.type == 'note_on' then
-    local pitch = self.right_split_base_note + (col - self.note_start_column) + (row-1)*5
+    local adjacent = nil
+    if self.right_split_legato_slide then
+      adjacent = self._right_split_active_notes[(col-1).."_"..row]
+                 or self._right_split_active_notes[(col+1).."_"..row]
+    end
+
+    if adjacent then
+      -- Slide continuation: same voice, same channel, same x_baseline --
+      -- no new note-on, no new channel allocated.
+      self._right_split_active_notes[key] = adjacent
+      adjacent.cols[col] = true
+      self:_set_right_split_led(col, row, 1) -- still flash red for player feedback
+      return
+    end
+
+    local pitch = self.right_split_base_note + (col - self.note_start_column) + (row-1)*5 + self.right_split_octave_shift*12
     pitch = math.max(0, math.min(127, pitch))
     local channel = self:_mpe_alloc_channel()
     if not channel then
       print("MPE: no free channel, dropping note col", col, "row", row)
       return
     end
-    self._right_split_active_notes[key] = {pitch=pitch, channel=channel, col=col, row=row}
+    -- x_baseline starts nil: _handle_right_split_x_cc treats the first X
+    -- reading it sees for this key as the zero-bend reference point, since
+    -- the raw X data is an absolute board position, not a ready-to-use
+    -- bend amount (see patch #9 at the top of this file).
+    self._right_split_active_notes[key] = {pitch=pitch, channel=channel, col=col, row=row, x_baseline=nil, cols={[col]=true}}
     for _, out in ipairs(outs) do
       out:note_on(pitch, midi_msg.vel or 100, channel)
     end
-  else
+    self:_set_right_split_led(col, row, 1) -- red: pressed
+
+  else -- note_off
     local entry = self._right_split_active_notes[key]
-    if entry then
-      for _, out in ipairs(outs) do
-        out:note_off(entry.pitch, midi_msg.vel or 0, entry.channel)
-      end
-      self:_mpe_free_channel(entry.channel)
-      self._right_split_active_notes[key] = nil
+    if not entry then return end
+
+    entry.cols[col] = nil
+    self._right_split_active_notes[key] = nil
+    self._right_split_x_pending[key] = nil
+    self:_set_right_split_led(col, row, self:_right_split_static_color(col, row)) -- this pad back to its normal color regardless
+
+    if next(entry.cols) ~= nil then
+      -- another column is still aliased to this voice (mid-slide) -- it's
+      -- still sounding, so don't touch the synth or free the channel yet.
+      return
     end
+
+    for _, out in ipairs(outs) do
+      out:note_off(entry.pitch, midi_msg.vel or 0, entry.channel)
+    end
+    self:_mpe_free_channel(entry.channel)
   end
 end
 
--- Forward pitch bend / channel pressure / poly key pressure arriving from
--- the LinnStrument's right split to whichever currently-held note(s) it
--- applies to, on that note's own allocated MPE member channel, on the
--- currently selected output device(s) -- true per-note MPE expression,
--- subject to the row-granularity limitation documented at the top of this
--- file.
+-- Forward the LinnStrument's raw per-column X (pitch) data to whichever
+-- currently-held note it belongs to, on that note's own allocated MPE
+-- member channel.
 --
--- Field names/ranges below are confirmed (2026-09) against norns'
--- lua/core/midi.lua source, both for what midi.to_msg() hands us and for
--- the matching dev:*() send methods:
---   pitchbend:         to_msg -> {type, val (14-bit, 0-16383, center 8192), ch}
---                       dev:pitchbend(val, ch)
---   channel_pressure:  to_msg -> {type, val (0-127), ch}
---                       dev:channel_pressure(val, ch)
---   key_pressure:      to_msg -> {type, note, val (0-127), ch}
---                       dev:key_pressure(note, val, ch)
--- (NOTE: an earlier version of this file logged midi_msg.bend -- that field
--- does not exist on any of these message types; it's .val throughout. If
--- you see nil values logged anywhere below, that's the tell this drifted
--- from the real norns API again -- re-check against core/midi.lua rather
--- than guessing.)
+-- Under User Firmware Mode this arrives as a 14-bit CC pair -- MSB on CC
+-- 0-25, LSB on CC 32-57, LSB sent first -- with the column number baked
+-- directly into the CC number itself (col = cc for the MSB CC, col = cc-32
+-- for the LSB CC) and the row baked into the channel, same convention as
+-- everywhere else in this file. See patch #9 at the top of this file for
+-- how this was confirmed against the actual firmware source, correcting
+-- the earlier (wrong) assumption that this arrives as a standard MIDI
+-- pitchbend message.
 --
--- key_pressure carries an explicit note number (col) as well as channel
--- (row), so unlike pitchbend/channel_pressure it can be routed to the exact
--- held note even when two notes share a row -- our LinnStrument's Z setting
--- turned out to be sending poly/key pressure (confirmed on real hardware,
--- 2026-09), not channel pressure.
+-- The reconstructed 14-bit value is an ABSOLUTE position across the whole
+-- board (0-4265 on a LinnStrument 200), not a ready-to-use bend amount, and
+-- it already has the note's starting position baked in by the firmware --
+-- so we capture whatever it reads the instant a note goes down as that
+-- note's own baseline (see _handle_right_split_note), and treat every later
+-- reading for that same column+row as a delta from that baseline. That
+-- delta, divided by right_split_x_sensitivity (raw units per column, i.e.
+-- per semitone in this split's tuning) and then by
+-- right_split_bend_range_semitones (must match the synth's own configured
+-- bend range), gives a normalized -1..1 value we scale into the outgoing
+-- 14-bit pitchbend range dev:pitchbend() expects (0-16383, center 8192).
+function device:_handle_right_split_x_cc(midi_msg)
+  local cc, row = midi_msg.cc, midi_msg.ch
+  local col, half
+  if cc >= 0 and cc <= 25 then
+    col, half = cc, 'msb'
+  elseif cc >= 32 and cc <= 57 then
+    col, half = cc - 32, 'lsb'
+  else
+    return
+  end
+
+  local key = col.."_"..row
+  local entry = self._right_split_active_notes[key]
+  if not entry then return end -- no held note at this column/row right now
+
+  local pending = self._right_split_x_pending[key]
+  if not pending then
+    pending = {}
+    self._right_split_x_pending[key] = pending
+  end
+  pending[half] = midi_msg.val
+
+  if pending.msb == nil or pending.lsb == nil then return end -- wait for the other half of the pair
+
+  local raw = (pending.msb * 128) + pending.lsb
+  if entry.x_baseline == nil then
+    entry.x_baseline = raw -- first reading after note-on: this is the zero-bend reference
+    return
+  end
+
+  local semitone_delta = (raw - entry.x_baseline) / self.right_split_x_sensitivity
+  local normalized = semitone_delta / self.right_split_bend_range_semitones
+  if normalized > 1 then normalized = 1 elseif normalized < -1 then normalized = -1 end
+  local bend14 = math.floor(8192 + normalized * 8191 + 0.5)
+
+  for _, out in ipairs(self:_get_current_outputs()) do
+    out:pitchbend(bend14, entry.channel)
+  end
+end
+
+-- Forward the LinnStrument's raw per-column Y (timbre) data to whichever
+-- currently-held note it belongs to, on that note's own allocated MPE
+-- member channel. Under User Firmware Mode this arrives as a single 7-bit
+-- CC per column (CC 64-89, col = cc-64), row baked into the channel.
+-- Corrects the earlier (wrong) assumption that Y always arrives as a fixed
+-- CC74 -- see patch #9 at the top of this file.
+function device:_handle_right_split_y_cc(midi_msg)
+  local col, row = midi_msg.cc - 64, midi_msg.ch
+  local key = col.."_"..row
+  local entry = self._right_split_active_notes[key]
+  if not entry then return end
+
+  for _, out in ipairs(self:_get_current_outputs()) do
+    out:cc(self.right_split_timbre_cc, midi_msg.val, entry.channel)
+  end
+end
+
+-- Forward poly key pressure (Z) arriving from the LinnStrument's right
+-- split to whichever currently-held note it applies to, on that note's own
+-- allocated MPE member channel. key_pressure carries an explicit note
+-- number (col) as well as channel (row), so it routes to the exact held
+-- note directly -- no same-column/row ambiguity here.
+--
+-- Field names/ranges below are confirmed against norns' lua/core/midi.lua
+-- source, both for what midi.to_msg() hands us and for the matching
+-- dev:*() send methods:
+--   key_pressure:  to_msg -> {type, note, val (0-127), ch}
+--                  dev:key_pressure(note, val, ch)
+--   pitchbend (used by _handle_right_split_x_cc above, for our own
+--   OUTGOING bend, not for anything incoming from the LinnStrument):
+--                  dev:pitchbend(val (14-bit, 0-16383, center 8192), ch)
 --
 -- IMPORTANT: incoming key_pressure is re-encoded as an OUTGOING
 -- channel_pressure on the note's own allocated MPE channel, rather than
@@ -546,41 +859,11 @@ end
 -- real key_pressure, that's a one-line change back to out:key_pressure(...)
 -- below.
 function device:_handle_right_split_expression(midi_msg)
-  local outs = self:_get_current_outputs()
-  if #outs == 0 then return end
-
-  if midi_msg.type == 'key_pressure' then
-    local key = midi_msg.note.."_"..midi_msg.ch
-    local entry = self._right_split_active_notes[key]
-    if not entry then return end
-    for _, out in ipairs(outs) do
-      out:channel_pressure(midi_msg.val, entry.channel)
-    end
-    return
-  end
-
-  -- pitchbend / channel_pressure: channel-wide (no note number), so apply
-  -- to every note currently held on this row (usually just one -- see the
-  -- same-row limitation note above).
-  local row = midi_msg.ch
-  for _, entry in pairs(self._right_split_active_notes) do
-    if entry.row == row then
-      for _, out in ipairs(outs) do
-        if midi_msg.type == 'pitchbend' then
-          out:pitchbend(midi_msg.val, entry.channel)
-        elseif midi_msg.type == 'channel_pressure' then
-          out:channel_pressure(midi_msg.val, entry.channel)
-        elseif midi_msg.type == 'cc' and midi_msg.cc == 74 then
-          -- incoming Y/timbre from the LinnStrument (always CC74, the MPE
-          -- convention) -- re-sent as whichever CC right_split_timbre_cc
-          -- names, on this note's own MPE channel. Same same-row caveat as
-          -- pitchbend/channel_pressure: two notes sharing a row both get
-          -- the same value, since none of these three message types carry
-          -- a note number.
-          out:cc(self.right_split_timbre_cc, midi_msg.val, entry.channel)
-        end
-      end
-    end
+  local key = midi_msg.note.."_"..midi_msg.ch
+  local entry = self._right_split_active_notes[key]
+  if not entry then return end
+  for _, out in ipairs(self:_get_current_outputs()) do
+    out:channel_pressure(midi_msg.val, entry.channel)
   end
 end
 
@@ -588,13 +871,21 @@ function device.event(self,vgrid,event)
 
   local midi_msg = midi.to_msg(event)
 
-  print(midi_msg.type, midi_msg.ch, midi_msg.note, midi_msg.vel)
+  if self.debug_midi then
+    print(midi_msg.type, midi_msg.ch, midi_msg.note, midi_msg.cc, midi_msg.val)
+  end
 
   if (midi_msg.type == 'note_on' or midi_msg.type == 'note_off') then
     if midi_msg.note == self.select_column then
-      -- device-select column: only act on note_on (a "press"), row = channel
+      -- column 17: only act on note_on (a "press"), row = channel. Slots
+      -- 5-8 are octave presets; everything else is device selection.
       if midi_msg.type == 'note_on' then
-        self:_select_output_device(midi_msg.ch)
+        local slot = 9 - midi_msg.ch
+        if self.right_split_octave_presets[slot] then
+          self:_select_octave_preset(slot)
+        else
+          self:_select_output_device(midi_msg.ch)
+        end
       end
       return
     end
@@ -614,10 +905,26 @@ function device.event(self,vgrid,event)
     return
   end
 
-  if midi_msg.type == 'pitchbend' or midi_msg.type == 'channel_pressure' or midi_msg.type == 'key_pressure'
-     or (midi_msg.type == 'cc' and midi_msg.cc == 74) then
+  if midi_msg.type == 'key_pressure' then
+    -- Z (pressure) -- see _handle_right_split_expression.
     self:_handle_right_split_expression(midi_msg)
     return
+  end
+
+  if midi_msg.type == 'cc' then
+    -- Under User Firmware Mode, X (pitch) and Y (timbre) both arrive as CC
+    -- messages with the column baked into the CC number itself -- see
+    -- patch #9 at the top of this file. Any CC outside these two ranges
+    -- (e.g. our own outgoing activation CCs 9-12 reflected back, or
+    -- anything else) falls through and is ignored.
+    local cc = midi_msg.cc
+    if (cc >= 0 and cc <= 25) or (cc >= 32 and cc <= 57) then
+      self:_handle_right_split_x_cc(midi_msg)
+      return
+    elseif cc >= 64 and cc <= 89 then
+      self:_handle_right_split_y_cc(midi_msg)
+      return
+    end
   end
 
   -- Any other message type on a channel outside this device's grid mapping:
