@@ -35,6 +35,21 @@
 --      norns midi field names/ranges this was built against (confirmed
 --      2026-09 against norns' lua/core/midi.lua source; earlier logging
 --      here had guessed a wrong field name for pitchbend).
+--   7. Turned out #6 alone wasn't enough: User Firmware Mode doesn't send
+--      ANY continuous data (pitch bend/timbre/pressure) per row until it's
+--      explicitly activated for that row via CC 9-12 sent TO the
+--      LinnStrument (confirmed against the LinnStrument firmware source --
+--      see _activate_continuous_data). Without this, #6's forwarding logic
+--      was correct but had nothing to forward -- notes and velocity worked
+--      fine, but no expression ever arrived, which is exactly what testing
+--      on real hardware showed (2026-09) before this was found.
+--   8. Third MPE dimension: incoming Y/timbre (always CC74 from the
+--      LinnStrument) is now forwarded too, as whichever CC number
+--      right_split_timbre_cc names, on the note's own MPE channel -- see
+--      that field's comment for why the outgoing CC is configurable
+--      (Dreadbox documents CC74 on the Nymphes as a hardwired filter
+--      cutoff control, not a generic timbre input; untested whether that
+--      or CC1/mod wheel behaves better per-note under MPE).
 --
 -- Why #2 is necessary: midigrid requires the LinnStrument's "User Firmware
 -- Mode" to be on so that the LEFT split's raw column/row data (channel=row,
@@ -145,6 +160,19 @@ local device={
   -- own native Note Lights behavior. Major scale, root C.
   right_split_scale = {[0]=true,[2]=true,[4]=true,[5]=true,[7]=true,[9]=true,[11]=true},
 
+  -- ---- right-split timbre (Y-axis / CC74) ----
+  -- The LinnStrument sends Y (timbre) as CC74, the standard MPE convention
+  -- -- that part isn't configurable, it's what arrives. What IS configurable
+  -- is which CC number gets sent OUT to the synth, because CC74's actual
+  -- behavior varies by manufacturer: per Dreadbox's own published CC list,
+  -- CC74 on the Nymphes is hardwired to "LPF cutoff" specifically, not a
+  -- generic assignable "timbre" input the way some MPE synths treat it. If
+  -- that doesn't produce the effect you want -- or doesn't respond per-note
+  -- the way pitch bend/pressure do -- try 1 (mod wheel), which Nymphes
+  -- supports as a separately assignable modulation source in its own mod
+  -- matrix. Change this one number; no other code changes needed.
+  right_split_timbre_cc = 74,
+
   -- ---- output device select (column 17) ----
   -- One pad = one output device, numbered by SLOT (1-8) starting at the TOP
   -- of the instrument and counting down -- slot 1 is the topmost pad in
@@ -177,7 +205,7 @@ local device={
   output_devices = {
     {label = "Nymphes",      device_name = "Nymphes"},
     {label = "Micromonsta 2",device_name = "MicroMonsta 2"},
-    {label = "iPad (via U6)",device_name = nil},
+    {label = "iPad (via U6)",device_name = "U6MIDI Pro 1"}, -- confirmed 2026-09: this is the U6MIDI Pro's physical port 1, the one wired via 5-pin MIDI cable (white=OUT1, black=IN1) to the CME U2MIDI Pro that reaches the iPad
     {label = "Both (Nymphes + Micromonsta 2)", device_name = {"Nymphes", "MicroMonsta 2"}},
     {label = nil, device_name = nil},
     {label = nil, device_name = nil},
@@ -201,6 +229,21 @@ local device={
 
 function device:_init(vgrid,device_number)
   self.vgrid = vgrid
+  -- NOTE (2026-09, reverting an earlier mistake): device_number here is
+  -- NOT a MIDI port index -- it's which grid SLOT this is (1st or 2nd
+  -- simultaneous grid device, matching midigrid's own "rotate second
+  -- device" option), confirmed against midigrid's actual source
+  -- (jaggednz/midigrid, lib/midigrid.lua). midigrid resolves the
+  -- LinnStrument's real MIDI port itself, by scanning midi.devices for a
+  -- name match and setting device.midi_id directly -- every time the
+  -- script loads, so it's already robust to USB devices being added,
+  -- removed, or renumbered. An earlier version of this file overwrote
+  -- that correctly auto-detected midi_id with device_number here, which
+  -- happened to be harmless only by coincidence (both were "1") until
+  -- more USB devices pushed the LinnStrument to a different port, at
+  -- which point it silently broke ALL LED output (grid and column 17
+  -- alike) by sending it to the wrong device. Do not reintroduce this --
+  -- leave self.midi_id exactly as midigrid set it.
   self:_mpe_reset_channels()
   self:_reset()
 end
@@ -210,8 +253,45 @@ function device:_reset()
     midi.devices[self.midi_id]:send(self.init_device_msg)
     print("msg")
   end
+  self:_activate_continuous_data()
   self:_light_right_split()
   self:_light_select_column()
+end
+
+-- Turn on User Firmware Mode's per-row continuous-data output. Confirmed
+-- (2026-09) against the LinnStrument firmware source (ls_midi.ino): under
+-- UFM, X (pitch bend) / Y (timbre, CC74) / Z (pressure) reporting is a
+-- separate per-row on/off flag from note on/off, and it does NOT default to
+-- on -- nothing continuous is ever sent until this is explicitly turned on
+-- for that row. This is exactly why _handle_right_split_expression never
+-- fired despite normal playing: the LinnStrument was never told to start
+-- sending anything continuous in the first place.
+--
+-- These are sent TO the LinnStrument itself (same midi_id device object
+-- used for the LED CCs above), one MIDI channel per row (channel = row,
+-- 1-8, matching the same row<->channel convention used everywhere else in
+-- this file):
+--   CC 10, value 1 on channel <row>: activate X (pitch bend) for that row
+--   CC 11, value 1 on channel <row>: activate Y (timbre / CC74) for that row
+--   CC 12, value 1 on channel <row>: activate Z (pressure) for that row
+--   CC  9, value 1 on channel <row>: "slide mode" for that row -- exact
+--     behavior unconfirmed from the firmware source comments; included
+--     here as it's part of the same per-row activation group, but if
+--     pitch/expression behaves oddly (e.g. sliding retriggers notes
+--     instead of bending smoothly), try sending this one as 0 instead and
+--     see if that changes it.
+-- Since this activates per ROW (channel), not per split, it applies to
+-- both splits alike -- harmless for the left split (midigrid), which never
+-- looks at continuous data.
+function device:_activate_continuous_data()
+  local dev = midi.devices[self.midi_id]
+  if not dev then return end
+  for row = 1, self.height do
+    dev:cc(9, 1, row)  -- slide mode (unconfirmed semantics -- see comment above)
+    dev:cc(10, 1, row) -- X / pitch bend active
+    dev:cc(11, 1, row) -- Y / timbre active
+    dev:cc(12, 1, row) -- Z / pressure active
+  end
 end
 
 -- Refill the pool of free MPE member channels (2-16) to full, discarding any
@@ -447,12 +527,24 @@ end
 --
 -- key_pressure carries an explicit note number (col) as well as channel
 -- (row), so unlike pitchbend/channel_pressure it can be routed to the exact
--- held note even when two notes share a row -- IF your LinnStrument's Z
--- (pressure) setting is sending poly/key pressure rather than channel
--- pressure. Whichever your hardware actually sends, this handles it: test
--- by pressing/sliding a held pad and watching the norns matron log (or
--- maiden) for which message type prints below, then confirm the resulting
--- MPE behavior on the synth matches what you expect for that type.
+-- held note even when two notes share a row -- our LinnStrument's Z setting
+-- turned out to be sending poly/key pressure (confirmed on real hardware,
+-- 2026-09), not channel pressure.
+--
+-- IMPORTANT: incoming key_pressure is re-encoded as an OUTGOING
+-- channel_pressure on the note's own allocated MPE channel, rather than
+-- forwarded as key_pressure. Since each held note already has its own
+-- exclusive MPE channel, channel pressure on that channel IS per-note
+-- pressure -- there's no ambiguity to worry about, same as ROLI's own MPE
+-- guidance for the Seaboard (channel pressure and poly aftertouch produce
+-- an identical musical result once every note has its own channel). This
+-- matters because some MPE synths only listen for one or the other --
+-- confirmed on real hardware (2026-09) that the Micromonsta 2 did not
+-- audibly respond to key_pressure even though it was confirmed arriving
+-- correctly matched to the held note; sending it as channel_pressure
+-- instead is the fix. If some other output device turns out to prefer
+-- real key_pressure, that's a one-line change back to out:key_pressure(...)
+-- below.
 function device:_handle_right_split_expression(midi_msg)
   local outs = self:_get_current_outputs()
   if #outs == 0 then return end
@@ -462,7 +554,7 @@ function device:_handle_right_split_expression(midi_msg)
     local entry = self._right_split_active_notes[key]
     if not entry then return end
     for _, out in ipairs(outs) do
-      out:key_pressure(entry.pitch, midi_msg.val, entry.channel)
+      out:channel_pressure(midi_msg.val, entry.channel)
     end
     return
   end
@@ -478,6 +570,14 @@ function device:_handle_right_split_expression(midi_msg)
           out:pitchbend(midi_msg.val, entry.channel)
         elseif midi_msg.type == 'channel_pressure' then
           out:channel_pressure(midi_msg.val, entry.channel)
+        elseif midi_msg.type == 'cc' and midi_msg.cc == 74 then
+          -- incoming Y/timbre from the LinnStrument (always CC74, the MPE
+          -- convention) -- re-sent as whichever CC right_split_timbre_cc
+          -- names, on this note's own MPE channel. Same same-row caveat as
+          -- pitchbend/channel_pressure: two notes sharing a row both get
+          -- the same value, since none of these three message types carry
+          -- a note number.
+          out:cc(self.right_split_timbre_cc, midi_msg.val, entry.channel)
         end
       end
     end
@@ -514,7 +614,8 @@ function device.event(self,vgrid,event)
     return
   end
 
-  if midi_msg.type == 'pitchbend' or midi_msg.type == 'channel_pressure' or midi_msg.type == 'key_pressure' then
+  if midi_msg.type == 'pitchbend' or midi_msg.type == 'channel_pressure' or midi_msg.type == 'key_pressure'
+     or (midi_msg.type == 'cc' and midi_msg.cc == 74) then
     self:_handle_right_split_expression(midi_msg)
     return
   end
